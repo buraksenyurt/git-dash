@@ -1,5 +1,7 @@
 # Zig 0.17 ile Git Aktivite Takvimi Geliştirmek
 
+> **Not:** Bu öğreti aracın WSL/Ubuntu için yazılan ilk sürümünü anlatır (tarih hesabı GNU `date` ile yapılır, `zig build-exe` ile derlenir). Repodaki güncel `src/main.zig` platformdan bağımsızdır: tarih `git var GIT_COMMITTER_IDENT` ile hesaplanır, argümanlar `iterateAllocator` ile okunur ve proje `zig build` ile derlenir. Ayrıntılar için [README](../README.md).
+
 **Platform:** Windows Subsystem for Linux (WSL) / Ubuntu  
 **Dil:** Zig 0.17.0  
 **Seviye:** Başlangıç–Orta  

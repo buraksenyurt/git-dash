@@ -1,0 +1,16 @@
+# Zig
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Release workflow scratch
+out/
+fragment-*.json
+
+# Editor / OS
+.vs/
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db

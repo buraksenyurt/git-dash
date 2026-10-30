@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The smoke test reads this repository's own history.
+          fetch-depth: 0
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - run: zig fmt --check src build.zig build.zig.zon
+      - run: zig build test --summary all
+      - run: zig build -Doptimize=ReleaseSafe
+
+      # Runs the real binary against this repository: git, today's date and
+      # the output must work on every platform (Windows has no GNU `date`).
+      - name: Duman testi
+        run: |
+          set -euo pipefail
+          out=$(./zig-out/bin/git-dash . 30)
+          printf '%s\n' "$out"
+          grep -q "last 30 days" <<<"$out"
+          grep -q "Pzt" <<<"$out"
+          if ./zig-out/bin/git-dash . 0 >/dev/null 2>&1; then
+            echo "::error::0 gün reddedilmeliydi"; exit 1
+          fi

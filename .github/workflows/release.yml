@@ -1,0 +1,99 @@
+# Bir sürüm tag'i (v1.2.3) push'landığında git-dash'i tek bir Linux runner'dan
+# bütün hedeflere çapraz derler (Zig), dosyaları taslak bir GitHub Release'e
+# yükler, release.json'u üretir ve yayınlar.
+#
+# Sürüm çıkarmak:
+#   1. build.zig.zon içindeki .version değerini güncelle, commit'le
+#   2. git tag -m "v1.2.3" v1.2.3 && git push origin v1.2.3
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Derlenecek mevcut tag (örn. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TOOL: git-dash
+  TAG: ${{ inputs.tag || github.ref_name }}
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  release:
+    name: Derle ve yayınla
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Tag ile proje sürümü aynı mı?
+        id: version
+        run: |
+          version=$(scripts/release/check-version.sh "$TAG" \
+            "$(sed -n 's/.*\.version = "\(.*\)".*/\1/p' build.zig.zon | head -1)")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Testler
+        run: zig build test --summary all
+
+      - name: Taslak release
+        run: |
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)" = "false" ]; then
+            echo "::error::$TAG zaten yayınlanmış. Yayınlanmış bir sürüm değiştirilmez; yeni bir sürüm çıkar."
+            exit 1
+          fi
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --draft --verify-tag --generate-notes --title "git-dash $TAG"
+
+      # Each binary is a single file: format "file", entry = the file itself.
+      # Linux builds are static; the macOS ones are ad-hoc signed by Zig.
+      - name: Çapraz derleme ve paketleme
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p out fragments
+          while read -r key target ext; do
+            asset="$TOOL-$RELEASE_VERSION-$key$ext"
+            zig build -Doptimize=ReleaseSafe -Dtarget="$target" --prefix "zig-out/$key"
+            cp "zig-out/$key/bin/$TOOL$ext" "out/$asset"
+            scripts/release/fragment.sh "$key" "fragments/$key.json" "out/$asset" file "$asset"
+          done <<'TARGETS'
+          windows-x64 x86_64-windows .exe
+          windows-arm64 aarch64-windows .exe
+          linux-x64 x86_64-linux
+          linux-arm64 aarch64-linux
+          macos-x64 x86_64-macos
+          macos-arm64 aarch64-macos
+          TARGETS
+          ls -la out
+
+      - name: Release'e yükle ve yayınla
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          scripts/release/compose-manifest.sh "$TOOL" "$RELEASE_VERSION" "$TAG" "$GH_REPO" \
+            "$(git rev-parse HEAD)" fragments > release.json
+          cat release.json
+          gh release upload "$TAG" out/* release.json --clobber
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            gh release edit "$TAG" --draft=false --prerelease
+          else
+            gh release edit "$TAG" --draft=false --latest
+          fi

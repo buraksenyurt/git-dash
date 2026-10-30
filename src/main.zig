@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const days_visible: usize = 180;
 const month_names = [_][]const u8{
@@ -37,11 +38,24 @@ const Date = struct {
     day: usize,
 };
 
+// Windows: the console's default code page (857 in Turkey) would garble the
+// UTF-8 month and day names. Not in std, so declared here.
+extern "kernel32" fn SetConsoleOutputCP(code_page: c_uint) callconv(.winapi) c_int;
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
-    var args = init.minimal.args.iterate();
+    if (builtin.os.tag == .windows) {
+        _ = SetConsoleOutputCP(65001);
+        // Colours in a plain console; a no-op (error) when output is a pipe.
+        std.Io.File.stdout().enableAnsiEscapeCodes(io) catch {};
+    }
+
+    // iterateAllocator, not iterate: Windows needs to allocate to decode the
+    // UTF-16 command line (iterate() does not compile for Windows).
+    var args = try init.minimal.args.iterateAllocator(allocator);
+    defer args.deinit();
     _ = args.next(); // executable name
     const repo_path: []const u8 = args.next() orelse ".";
     const days_count: usize = if (args.next()) |arg|
@@ -49,35 +63,35 @@ pub fn main(init: std.process.Init) !void {
     else
         days_visible;
     if (days_count == 0 or args.next() != null) {
-        std.debug.print("Kullanim: git-activity [repo-yolu] [gun-sayisi]\n", .{});
+        std.debug.print("Kullanim: git-dash [repo-yolu] [gun-sayisi]\n", .{});
         return error.InvalidArguments;
     }
 
-    // GNU date is available on Ubuntu/WSL.
-    const today_result = try std.process.run(allocator, io, .{
-        .argv = &.{ "date", "+%F" },
+    // Today's local date comes from git itself, so no platform tool (GNU
+    // `date` exists on Linux/WSL but not on Windows) is needed: the committer
+    // ident ends with "<unix-time> <+hhmm>", git's own clock and time zone.
+    // A throwaway identity keeps it working where none is configured.
+    const ident_result = try std.process.run(allocator, io, .{
+        .argv = &.{
+            "git",                 "-c",                            "user.name=git-dash",
+            "-c",                  "user.email=git-dash@localhost", "var",
+            "GIT_COMMITTER_IDENT",
+        },
     });
-    defer allocator.free(today_result.stdout);
-    defer allocator.free(today_result.stderr);
-    if (!today_result.term.success()) return error.DateCommandFailed;
+    defer allocator.free(ident_result.stdout);
+    defer allocator.free(ident_result.stderr);
+    if (!ident_result.term.success()) {
+        std.debug.print("Git bulunamadi ya da calismadi: {s}\n", .{ident_result.stderr});
+        return error.GitCommandFailed;
+    }
 
-    const start_offset = try allocator.print("{d} days ago", .{days_count - 1});
-    defer allocator.free(start_offset);
-    const start_result = try std.process.run(allocator, io, .{
-        .argv = &.{ "date", "-d", start_offset, "+%F" },
-    });
-    defer allocator.free(start_result.stdout);
-    defer allocator.free(start_result.stderr);
-    if (!start_result.term.success()) return error.DateCommandFailed;
-
-    const today_date = std.mem.trim(u8, today_result.stdout, " \t\r\n");
-    const start_date = std.mem.trim(u8, start_result.stdout, " \t\r\n");
-    const last_day = try parseDay(today_date);
+    const last_day = try localDayFromIdent(std.mem.trim(u8, ident_result.stdout, " \t\r\n"));
     const first_day = last_day - @as(i64, @intCast(days_count - 1));
 
-    // At local midnight, --since includes the entire first day.
-    const since_arg = try allocator.print("--since={s}", .{start_date});
-    defer allocator.free(since_arg);
+    // One day of slack: commits are counted per local day below, so the exact
+    // time git uses for a bare date in --since does not matter.
+    var since_buf: [32]u8 = undefined;
+    const since_arg = try std.fmt.bufPrint(&since_buf, "--since={s}", .{formatDay(first_day - 1)[0..]});
 
     const git_result = try std.process.run(allocator, io, .{
         .argv = &.{
@@ -160,6 +174,30 @@ fn render(out: *std.Io.Writer, counts: []const u32, first_day: i64, last_day: i6
     try out.writeAll(" More\n\n");
 }
 
+/// "Name <email> 1761836400 +0300" → days since 1970-01-01 in that zone.
+fn localDayFromIdent(ident: []const u8) !i64 {
+    var parts = std.mem.splitBackwardsScalar(u8, ident, ' ');
+    const zone = parts.next() orelse return error.InvalidIdent;
+    const stamp = parts.next() orelse return error.InvalidIdent;
+    if (zone.len != 5 or (zone[0] != '+' and zone[0] != '-')) return error.InvalidIdent;
+    const seconds = std.fmt.parseInt(i64, stamp, 10) catch return error.InvalidIdent;
+    const hours = std.fmt.parseInt(i64, zone[1..3], 10) catch return error.InvalidIdent;
+    const minutes = std.fmt.parseInt(i64, zone[3..5], 10) catch return error.InvalidIdent;
+    var offset = hours * 3600 + minutes * 60;
+    if (zone[0] == '-') offset = -offset;
+    return @divFloor(seconds + offset, 86400);
+}
+
+/// Days since 1970-01-01 → "YYYY-MM-DD".
+fn formatDay(day_number: i64) [10]u8 {
+    const date = civilFromDays(day_number);
+    var out: [10]u8 = undefined;
+    _ = std.fmt.bufPrint(&out, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        @as(u64, @intCast(date.year)), date.month, date.day,
+    }) catch unreachable;
+    return out;
+}
+
 fn colorLevel(commits: u32) usize {
     if (commits == 0) return 0;
     if (commits == 1) return 1;
@@ -219,4 +257,25 @@ test "activity buckets" {
     try std.testing.expectEqual(@as(usize, 2), colorLevel(3));
     try std.testing.expectEqual(@as(usize, 3), colorLevel(5));
     try std.testing.expectEqual(@as(usize, 4), colorLevel(7));
+}
+
+test "local day from the committer ident" {
+    // 2026-10-30 21:30 UTC is already 2026-10-31 in Istanbul (+0300).
+    const utc_evening: i64 = daysFromCivil(2026, 10, 30) * 86400 + 21 * 3600 + 30 * 60;
+    var buf: [64]u8 = undefined;
+    const istanbul = try std.fmt.bufPrint(&buf, "Burak <b@x> {d} +0300", .{utc_evening});
+    try std.testing.expectEqual(daysFromCivil(2026, 10, 31), try localDayFromIdent(istanbul));
+    const new_york = try std.fmt.bufPrint(&buf, "git-dash <git-dash@localhost> {d} -0400", .{utc_evening});
+    try std.testing.expectEqual(daysFromCivil(2026, 10, 30), try localDayFromIdent(new_york));
+    // 2025-12-31 19:00 UTC is 2026-01-01 00:30 in India (+0530).
+    const india = try std.fmt.bufPrint(&buf, "a <b> {d} +0530", .{daysFromCivil(2026, 1, 1) * 86400 - 5 * 3600});
+    try std.testing.expectEqual(daysFromCivil(2026, 1, 1), try localDayFromIdent(india));
+    try std.testing.expectError(error.InvalidIdent, localDayFromIdent("bozuk"));
+    try std.testing.expectError(error.InvalidIdent, localDayFromIdent("a <b> 123 0300"));
+}
+
+test "format day" {
+    try std.testing.expectEqualStrings("1970-01-01", &formatDay(0));
+    try std.testing.expectEqualStrings("2024-02-29", &formatDay(daysFromCivil(2024, 2, 29)));
+    try std.testing.expectEqualStrings("2026-10-30", &formatDay(daysFromCivil(2026, 10, 30)));
 }
